@@ -1,0 +1,98 @@
+name: build-submission
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: image tag
+        default: v1
+  push:
+    branches: [main]
+    paths: ["app/**", "Dockerfile", "requirements.txt", ".github/workflows/build.yml"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Contract and citation logic against the sample corpus (mock model)
+        run: |
+          pip install -q pypdf pillow
+          # run as a non-root user so the mode-000 file genuinely raises
+          cp -r . /tmp/w && cd /tmp/w
+          mkdir -p tests/corpus/mc3-corpus/archive
+          sudo useradd -M tester || true
+          chmod -R a+rwX /tmp/w && chmod 000 tests/corpus/mc3-corpus/vendor/internal_audit.txt
+          sudo -u tester env PATH="$PATH" python tests/run_local.py tests/corpus/mc3-corpus tests/corpus/sample-questions.json | tee /tmp/out.txt
+          grep -q "score 200/200" /tmp/out.txt
+          grep -q "skipped vendor/internal_audit.txt  permission" /tmp/out.txt
+          sudo -u tester env PATH="$PATH" sh tests/plumbing.sh python tests/corpus/mc3-corpus
+
+  image:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Pool the runner's disks into one volume for Docker
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 1024
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          build-mount-path: /var/lib/docker-big
+
+      - name: Move Docker onto the big volume
+        run: |
+          sudo systemctl stop docker docker.socket
+          echo '{"data-root": "/var/lib/docker-big"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          docker info --format '{{.DockerRootDir}}'
+          df -h /var/lib/docker-big
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          TAG="${{ github.event.inputs.tag || 'v1' }}"
+          IMAGE="ghcr.io/$(echo '${{ github.repository_owner }}' | tr A-Z a-z)/mc3-rag:$TAG"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          DOCKER_BUILDKIT=1 docker build --progress=plain -t "$IMAGE" .
+          df -h /var/lib/docker-big
+
+      - name: Check the hard gates we can check without a GPU
+        run: |
+          set -e
+          echo "--- torch must still be the ROCm build"
+          docker run --rm "$IMAGE" python3 -c "import torch, torchvision; print(torch.__version__, torchvision.__version__); assert '+rocm' in torch.__version__"
+          echo "--- uncompressed size (limit 60 GiB)"
+          BYTES=$(docker image inspect -f '{{.Size}}' "$IMAGE")
+          python3 -c "b=$BYTES; print(f'{b/2**30:.2f} GiB'); assert b < 59.5*2**30, 'over the size limit'"
+          echo "--- base layers are intact (not squashed)"
+          docker history --no-trunc --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE" | head -20
+          echo "--- contract smoke test: no GPU, no network, dropped DAC_OVERRIDE"
+          mkdir -p /tmp/corpus && cp -r tests/corpus/mc3-corpus/. /tmp/corpus/ && mkdir -p /tmp/corpus/archive
+          chmod -R a+rX /tmp/corpus && chmod 000 /tmp/corpus/vendor/internal_audit.txt
+          docker run -d --name sut --network none --cap-drop DAC_OVERRIDE -v /tmp/corpus:/app/corpus:ro "$IMAGE"
+          docker exec sut python3 /app/app.py --index /app/corpus
+          docker exec sut python3 /app/app.py --corpus /app/corpus --query-id query_01 --query "What is the maximum junction temperature of the TQ-40?"
+          docker exec sut cat /app/output/query_01_output.json
+          docker exec sut python3 -c "import json; d=json.load(open('/app/output/query_01_output.json')); assert 'answer' in d and 'citations' in d"
+          docker exec sut sh -c "grep -E 'skipped|model load' /app/logs/server.log | head -20"
+          docker rm -f sut
+
+      - name: Push to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE"
+          echo "pushed $IMAGE" >> $GITHUB_STEP_SUMMARY
