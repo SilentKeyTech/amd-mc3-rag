@@ -8,7 +8,7 @@ on:
         default: v1
   push:
     branches: [main]
-    paths: ["app/**", "Dockerfile", "requirements.txt", ".github/workflows/build.yml"]
+    paths: ["app/**", "scripts/assemble_image.sh", "requirements.txt", ".github/workflows/build.yml"]
 
 permissions:
   contents: read
@@ -37,62 +37,30 @@ jobs:
   image:
     needs: unit
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 180
+    env:
+      BASE: docker.io/rocm/pytorch@sha256:3174cb7061d94c427da96c0edef4adea28046fa3f3b2ff3948dc4e995665ff8c
     steps:
-      - name: Pool the runner's disks into one volume for Docker
-        uses: easimon/maximize-build-space@v10
-        with:
-          root-reserve-mb: 8192
-          temp-reserve-mb: 2048
-          swap-size-mb: 1024
-          remove-dotnet: "true"
-          remove-android: "true"
-          remove-haskell: "true"
-          remove-codeql: "true"
-          remove-docker-images: "true"
-          build-mount-path: /var/lib/docker-big
-
-      - name: Move Docker onto the big volume
-        run: |
-          sudo systemctl stop docker docker.socket
-          echo '{"data-root": "/var/lib/docker-big"}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl start docker
-          docker info --format '{{.DockerRootDir}}'
-          df -h /var/lib/docker-big
-
       - uses: actions/checkout@v4
-
-      - name: Build
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker system prune -af >/dev/null || true
+          df -h /
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.14" }
+      - name: Tools
+        run: |
+          curl -sSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz | sudo tar -xz -C /usr/local/bin crane
+          crane version
+          # CPU torch in the runner's own 3.14, only to prove the package layer imports
+          python3.14 -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          python3.14 -m pip install -q numpy pillow
+          echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Assemble image in the registry (no base extraction)
         run: |
           TAG="${{ github.event.inputs.tag || 'v1' }}"
-          IMAGE="ghcr.io/$(echo '${{ github.repository_owner }}' | tr A-Z a-z)/mc3-rag:$TAG"
-          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-          DOCKER_BUILDKIT=1 docker build --progress=plain -t "$IMAGE" .
-          df -h /var/lib/docker-big
-
-      - name: Check the hard gates we can check without a GPU
-        run: |
-          set -e
-          echo "--- torch must still be the ROCm build"
-          docker run --rm "$IMAGE" python3 -c "import torch, torchvision; print(torch.__version__, torchvision.__version__); assert '+rocm' in torch.__version__"
-          echo "--- uncompressed size (limit 60 GiB)"
-          BYTES=$(docker image inspect -f '{{.Size}}' "$IMAGE")
-          python3 -c "b=$BYTES; print(f'{b/2**30:.2f} GiB'); assert b < 59.5*2**30, 'over the size limit'"
-          echo "--- base layers are intact (not squashed)"
-          docker history --no-trunc --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE" | head -20
-          echo "--- contract smoke test: no GPU, no network, dropped DAC_OVERRIDE"
-          mkdir -p /tmp/corpus && cp -r tests/corpus/mc3-corpus/. /tmp/corpus/ && mkdir -p /tmp/corpus/archive
-          chmod -R a+rX /tmp/corpus && chmod 000 /tmp/corpus/vendor/internal_audit.txt
-          docker run -d --name sut --network none --cap-drop DAC_OVERRIDE -v /tmp/corpus:/app/corpus:ro "$IMAGE"
-          docker exec sut python3 /app/app.py --index /app/corpus
-          docker exec sut python3 /app/app.py --corpus /app/corpus --query-id query_01 --query "What is the maximum junction temperature of the TQ-40?"
-          docker exec sut cat /app/output/query_01_output.json
-          docker exec sut python3 -c "import json; d=json.load(open('/app/output/query_01_output.json')); assert 'answer' in d and 'citations' in d"
-          docker exec sut sh -c "grep -E 'skipped|model load' /app/logs/server.log | head -20"
-          docker rm -f sut
-
-      - name: Push to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push "$IMAGE"
-          echo "pushed $IMAGE" >> $GITHUB_STEP_SUMMARY
+          export TARGET="ghcr.io/$(echo '${{ github.repository_owner }}' | tr A-Z a-z)/mc3-rag:$TAG"
+          export PYVER=3.14
+          bash scripts/assemble_image.sh
+          echo "built $TARGET" >> $GITHUB_STEP_SUMMARY

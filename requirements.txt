@@ -1,6 +1,5 @@
 # Installed against a constraints file that pins the base image's ROCm torch.
 transformers>=4.57
-accelerate
 huggingface_hub
 safetensors
 tokenizers
