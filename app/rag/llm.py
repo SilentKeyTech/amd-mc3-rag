@@ -58,17 +58,22 @@ class VLM:
 
         self.torch = torch
         path = model_path or os.environ.get("MC3_MODEL", "/models/vlm")
+        device = "cuda"
         if not torch.cuda.is_available():
-            raise RuntimeError("no GPU visible to torch; refusing to run on the CPU")
+            # The grader rejects CPU runs; the override exists only for local tests.
+            if not os.environ.get("MC3_ALLOW_CPU"):
+                raise RuntimeError("no GPU visible to torch; refusing to run on the CPU")
+            device = "cpu"
         t0 = time.time()
         self.processor = AutoProcessor.from_pretrained(path)
         kwargs = dict(dtype=torch.bfloat16, attn_implementation="sdpa")
         try:
-            self.model = AutoModelForImageTextToText.from_pretrained(path, device_map="cuda", **kwargs)
+            self.model = AutoModelForImageTextToText.from_pretrained(path, device_map=device, **kwargs)
         except (ImportError, ValueError, TypeError):  # no accelerate: load then move
-            self.model = AutoModelForImageTextToText.from_pretrained(path, **kwargs).to("cuda")
+            self.model = AutoModelForImageTextToText.from_pretrained(path, **kwargs).to(device)
         self.model.eval()
-        log.info("model loaded from %s in %.1fs on %s", path, time.time() - t0, torch.cuda.get_device_name(0))
+        log.info("model loaded from %s in %.1fs on %s", path, time.time() - t0,
+                 torch.cuda.get_device_name(0) if device == "cuda" else "cpu")
         self.generate([{"type": "text", "text": "Reply with OK."}], max_new_tokens=4)  # warm the kernels
         log.info("warmup done at %.1fs", time.time() - t0)
 
